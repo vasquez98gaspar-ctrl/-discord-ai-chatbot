@@ -9,7 +9,7 @@ SETUP (do this once):
   3. Run: python discord_bot.py
 
 COMMANDS:
-  /ask [question]     — Ask the AI anything
+  /ask [question]     — Ask the AI anything (agentic: it can call bot tools itself)
   /summarize          — Summarize the last 30 messages
   /warn @user [reason]— Warn a user (mods only)
   /warnings @user     — Check a user's warnings
@@ -18,7 +18,11 @@ COMMANDS:
   /jokeme             — Get a joke right now!
   /help               — Show all commands
 
-  @mention the bot    — Chat with it directly!
+  @mention the bot    — Chat with it directly! It remembers recent context per
+                         channel and can act on its own — e.g. "check
+                         @someone's warnings" or "summarize this channel and
+                         warn anyone being toxic" will chain the right tool
+                         calls without you needing separate slash commands.
 """
 
 import discord
@@ -50,6 +54,12 @@ BOT_PERSONALITY  = (
 MOD_ROLE_NAME    = "Moderator"          # Role name that can use mod commands
 MAX_WARNINGS     = 3                    # Warnings before auto-kick suggestion
 SUMMARIZE_LIMIT  = 30                   # Messages to pull for /summarize
+
+# ─────────────────────────────────────────────
+#  🤖  AGENT SETTINGS
+# ─────────────────────────────────────────────
+MAX_AGENT_STEPS       = 5   # Max tool-call round-trips per response, to avoid runaway loops
+CONVERSATION_MEMORY   = 10  # Messages of prior conversation kept per channel
 
 # ─────────────────────────────────────────────
 #  😂  JOKE OF THE DAY SETTINGS
@@ -87,6 +97,9 @@ warnings_db: dict[int, dict[int, list]] = defaultdict(lambda: defaultdict(list))
 # Joke channel storage  {guild_id: channel_id}
 joke_channels: dict[int, int] = {}
 
+# Per-channel conversation memory for the agent  {channel_id: [messages]}
+conversation_history: dict[int, list] = defaultdict(list)
+
 
 # ─────────────────────────────────────────────
 #  HELPER — call Claude
@@ -103,6 +116,185 @@ def ask_claude(prompt: str, system: str = BOT_PERSONALITY) -> str:
         return response.content[0].text
     except Exception as e:
         return f"⚠️ AI error: {e}"
+
+
+# ─────────────────────────────────────────────
+#  🤖  AGENTIC TOOLS — things Claude can decide to do itself
+# ─────────────────────────────────────────────
+TOOLS = [
+    {
+        "name": "get_channel_history",
+        "description": (
+            "Fetch recent messages from the current Discord channel, oldest first. "
+            "Use this before summarizing a conversation or judging someone's behavior."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "limit": {
+                    "type": "integer",
+                    "description": f"How many recent messages to fetch (max {SUMMARIZE_LIMIT * 3}).",
+                }
+            },
+            "required": ["limit"],
+        },
+    },
+    {
+        "name": "warn_user",
+        "description": (
+            "Issue an official moderation warning to a Discord user. "
+            "Only succeeds if the person you're talking to is a moderator or admin."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "username": {"type": "string", "description": "Display name or @mention of the user to warn."},
+                "reason": {"type": "string", "description": "Why the user is being warned."},
+            },
+            "required": ["username", "reason"],
+        },
+    },
+    {
+        "name": "get_warnings",
+        "description": "Look up how many moderation warnings a Discord user currently has, and why.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "username": {"type": "string", "description": "Display name or @mention of the user to check."},
+            },
+            "required": ["username"],
+        },
+    },
+    {
+        "name": "clear_warnings",
+        "description": (
+            "Clear all moderation warnings for a Discord user. "
+            "Only succeeds if the person you're talking to is a moderator or admin."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "username": {"type": "string", "description": "Display name or @mention of the user to clear."},
+            },
+            "required": ["username"],
+        },
+    },
+]
+
+
+def is_moderator(member: discord.Member) -> bool:
+    """Whether a guild member is allowed to run mod-only tools."""
+    mod_role = discord.utils.get(member.guild.roles, name=MOD_ROLE_NAME)
+    return member.guild_permissions.administrator or (mod_role in member.roles)
+
+
+def resolve_member(guild: discord.Guild, username: str) -> discord.Member | None:
+    """Best-effort lookup of a guild member from a display name or mention string."""
+    username = username.strip()
+    if username.startswith("<@") and username.endswith(">"):
+        user_id = int(username.strip("<@!>"))
+        return guild.get_member(user_id)
+    return discord.utils.find(
+        lambda m: username.lower() in (m.display_name.lower(), m.name.lower()),
+        guild.members,
+    )
+
+
+async def run_tool(tool_name: str, tool_input: dict, *, guild: discord.Guild,
+                    channel: discord.abc.Messageable, invoker: discord.Member) -> str:
+    """Execute a tool Claude asked for and return a plain-text result to feed back to it."""
+    if tool_name == "get_channel_history":
+        limit = max(1, min(int(tool_input.get("limit", SUMMARIZE_LIMIT)), SUMMARIZE_LIMIT * 3))
+        history = []
+        async for msg in channel.history(limit=limit):
+            if not msg.author.bot:
+                history.append(f"{msg.author.display_name}: {msg.content}")
+        history.reverse()
+        return "\n".join(history) if history else "No messages found."
+
+    if tool_name in ("warn_user", "clear_warnings") and not is_moderator(invoker):
+        return "Permission denied: only moderators or admins can do that."
+
+    if tool_name == "warn_user":
+        member = resolve_member(guild, tool_input["username"])
+        if not member:
+            return f"Could not find a member matching '{tool_input['username']}'."
+        warnings_db[guild.id][member.id].append({
+            "reason": tool_input["reason"],
+            "time": datetime.utcnow().isoformat(),
+            "by": str(invoker),
+        })
+        count = len(warnings_db[guild.id][member.id])
+        try:
+            await member.send(
+                f"⚠️ You received a warning in **{guild.name}**.\n"
+                f"**Reason:** {tool_input['reason']}\n"
+                f"You now have **{count}** warning(s)."
+            )
+        except discord.Forbidden:
+            pass
+        result = f"Warned {member.display_name} ({count}/{MAX_WARNINGS} warnings)."
+        if count >= MAX_WARNINGS:
+            result += " They've hit the max warning threshold — flag this for a mod."
+        return result
+
+    if tool_name == "get_warnings":
+        member = resolve_member(guild, tool_input["username"])
+        if not member:
+            return f"Could not find a member matching '{tool_input['username']}'."
+        user_warnings = warnings_db[guild.id][member.id]
+        if not user_warnings:
+            return f"{member.display_name} has no warnings."
+        lines = [f"- {w['reason']} ({w['time'][:10]})" for w in user_warnings]
+        return f"{member.display_name} has {len(user_warnings)} warning(s):\n" + "\n".join(lines)
+
+    if tool_name == "clear_warnings":
+        member = resolve_member(guild, tool_input["username"])
+        if not member:
+            return f"Could not find a member matching '{tool_input['username']}'."
+        warnings_db[guild.id][member.id].clear()
+        return f"Cleared all warnings for {member.display_name}."
+
+    return f"Unknown tool: {tool_name}"
+
+
+async def run_agent(prompt: str, *, guild: discord.Guild | None,
+                     channel: discord.abc.Messageable, invoker) -> str:
+    """
+    Send a message to Claude with tool access and loop, executing any tools it
+    requests, until it produces a final answer. Keeps a rolling window of
+    per-channel conversation history so the agent has memory across turns.
+    """
+    messages = conversation_history[channel.id] + [{"role": "user", "content": prompt}]
+    final_text = "I wasn't able to come up with a response."
+
+    for _ in range(MAX_AGENT_STEPS):
+        kwargs = dict(model="claude-sonnet-4-5", max_tokens=1000, system=BOT_PERSONALITY, messages=messages)
+        if guild is not None:
+            kwargs["tools"] = TOOLS
+        try:
+            response = ai_client.messages.create(**kwargs)
+        except Exception as e:
+            return f"⚠️ AI error: {e}"
+
+        messages.append({"role": "assistant", "content": response.content})
+
+        if response.stop_reason != "tool_use":
+            final_text = "".join(block.text for block in response.content if block.type == "text")
+            break
+
+        tool_results = []
+        for block in response.content:
+            if block.type != "tool_use":
+                continue
+            result_text = await run_tool(block.name, block.input, guild=guild, channel=channel, invoker=invoker)
+            tool_results.append({"type": "tool_result", "tool_use_id": block.id, "content": result_text})
+        messages.append({"role": "user", "content": tool_results})
+    else:
+        final_text = "That request needed more steps than I'm allowed to take — try breaking it down."
+
+    conversation_history[channel.id] = messages[-CONVERSATION_MEMORY:]
+    return final_text
 
 
 # ─────────────────────────────────────────────
@@ -164,7 +356,7 @@ async def on_message(message: discord.Message):
             await message.reply("Hey! Ask me anything 😊")
             return
         async with message.channel.typing():
-            reply = ask_claude(prompt)
+            reply = await run_agent(prompt, guild=message.guild, channel=message.channel, invoker=message.author)
         await message.reply(reply)
         return
 
@@ -251,7 +443,7 @@ async def slash_jokeme(interaction: discord.Interaction):
 @app_commands.describe(question="What do you want to know?")
 async def slash_ask(interaction: discord.Interaction, question: str):
     await interaction.response.defer(thinking=True)
-    answer = ask_claude(question)
+    answer = await run_agent(question, guild=interaction.guild, channel=interaction.channel, invoker=interaction.user)
     embed = discord.Embed(
         title="💬 AI Answer",
         description=answer,
@@ -393,7 +585,9 @@ async def slash_help(interaction: discord.Interaction):
         name="💬 Chat",
         value=(
             "`/ask [question]` — Ask me anything\n"
-            "`@mention me` — Have a conversation"
+            "`@mention me` — Have a conversation\n"
+            "I remember recent context per-channel and can call mod tools myself "
+            "(e.g. \"check @user's warnings\" or \"summarize this and warn anyone being toxic\")."
         ),
         inline=False,
     )

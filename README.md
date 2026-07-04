@@ -5,7 +5,10 @@ automated interactions, command handling, and AI-assisted workflow logic.
 
 ## Features
 - Automated command handling
-- AI-assisted responses
+- Agentic AI responses: Claude can call bot tools itself (checking/issuing
+  warnings, reading channel history) to satisfy a request in one turn,
+  instead of being limited to a single fixed prompt-and-reply
+- Per-channel conversation memory, so the bot has context across messages
 - Workflow automation logic
 
 ## Skills Used
