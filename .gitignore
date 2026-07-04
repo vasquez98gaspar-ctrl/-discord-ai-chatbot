@@ -1,0 +1,16 @@
+# Secrets — NEVER commit these
+.env
+discordbotkey.txt
+discordstuff.txt
+*.key
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+venv/
+.venv/
+
+# OS junk
+.DS_Store
+Thumbs.db
