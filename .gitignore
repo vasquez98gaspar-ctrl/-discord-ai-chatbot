@@ -1,0 +1,4 @@
+__pycache__/
+*.pyc
+kirkbot.db
+.env
